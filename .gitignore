@@ -30,4 +30,5 @@ nohup.out
 # ===== Temporary =====
 *.tmp
 *.swp
+*.tar.gz
 
