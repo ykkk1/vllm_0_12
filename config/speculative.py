@@ -46,7 +46,7 @@ SpeculativeMethod = Literal[
     "mlp_speculator",
     "draft_model",
     "suffix",
-    "ctc",
+    "ctc_draft",
     EagleModelTypes,
 ]
 
@@ -326,7 +326,7 @@ class SpeculativeConfig:
         elif self.method == "suffix":
             self._validate_suffix_decoding()
         # kyleryu
-        elif self.method == "ctc":
+        elif self.method == "ctc_draft":
             self._validate_ctc()
         else:
             self.prompt_lookup_max = 0
@@ -665,6 +665,6 @@ class SpeculativeConfig:
     def __repr__(self) -> str:
         method = self.method
         # kyleryu
-        model = None if method in ("ngram", "suffix", "ctc") else self.draft_model_config.model
+        model = None if method in ("ngram", "suffix", "ctc_draft") else self.draft_model_config.model
         num_spec_tokens = self.num_speculative_tokens
         return f"SpeculativeConfig({method=}, {model=}, {num_spec_tokens=})"
