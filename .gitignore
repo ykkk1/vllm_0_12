@@ -1,0 +1,33 @@
+# ===== Python cache =====
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# ===== VSCode =====
+.vscode/
+
+# ===== Conda / pip build artifacts =====
+*.so
+*.abi3.so
+*.dll
+*.dylib
+
+# ===== Large compiled extensions =====
+vllm_flash_attn/
+flash_attn/
+triton/
+
+# ===== Build / dist =====
+build/
+dist/
+*.egg-info/
+
+# ===== Logs =====
+*.log
+nohup.out
+
+# ===== Temporary =====
+*.tmp
+*.swp
+
