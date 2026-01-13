@@ -45,6 +45,8 @@ class SuffixDecodingProposer:
             max_tree_depth=config.suffix_decoding_max_tree_depth,
             max_cached_requests=config.suffix_decoding_max_cached_requests,
         )
+        # kyleryu - 添加计数器
+        self.step_count = 0
 
     # kyleryu
     # 提取ctc文本
@@ -91,7 +93,11 @@ class SuffixDecodingProposer:
         if not hasattr(self,'ctc_cache'):
             self.ctc_cache = {} # ctc文本  {req_id: ctc_token_ids} 字典
             self.ctc_pointer = {}# ctc指针 {req_id: current_position}
-
+        # ============ 添加：打印本轮概览 ============
+        self.step_count += 1
+        print("\n" + "="*100)
+        print(f"[STEP {self.step_count}] Batch Processing - {len(sampled_token_ids)} requests")
+        print("="*100)
 
         for i, sampled_ids in enumerate(sampled_token_ids):
             if not sampled_ids:
@@ -118,6 +124,13 @@ class SuffixDecodingProposer:
                 # if req_id in self.suffix_cache.cached_requests:
                 #     # Reset the suffix cache for this request.
                 #     self.suffix_cache.evict_cached_response(req_id)
+
+            # ============ 添加：打印请求基本信息 ============
+            print(f"\n{'─'*100}")
+            print(f"[Request {i}] ID: {req_id}")
+            print(f"  Current length: {num_tokens} tokens")
+
+
             if req_id not in self.ctc_cache: #首次处理该请求，提取ctc
                 num_prompt_tokens = input_batch.num_prompt_tokens[index]
                 prompt_token_ids = input_batch.token_ids_cpu[index, :num_prompt_tokens]
@@ -132,6 +145,10 @@ class SuffixDecodingProposer:
                     self.ctc_cache[req_id] = ctc_token_ids
                     self.ctc_pointer[req_id] = 0 # 初始化指针
                     ctc_text = self.tokenizer.decode(ctc_token_ids,skip_special_tokens=True)
+                    print(f"==== EXTRACTED CTC TEXT ====")
+                    print(f"CTC token IDs: {ctc_token_ids}")
+                    print(f"CTC text: {ctc_text}")
+                    print(f"============================")
                    
                 else:
                     print('No CTC text found.')
@@ -141,6 +158,20 @@ class SuffixDecodingProposer:
                 # Start a new request, this will build the suffix tree for that prompt.
                 self.suffix_cache.start_request(req_id, prompt_token_ids)
 
+
+            # ============ 关键打印：本轮接受的 tokens ============
+            print(f"\n  [ACCEPTED THIS STEP]")
+            print(f"    Token IDs: {sampled_ids}")
+            print(f"    Count: {len(sampled_ids)}")
+            try:
+                accepted_text = self.tokenizer.decode(sampled_ids, skip_special_tokens=True)
+                print(f"    Text: '{accepted_text}'")
+            except Exception as e:
+                print(f"    Text: [decode error:  {e}]")
+
+
+
+
             # Append the newly sampled ids to the suffix cache for this request.
             self.suffix_cache.add_active_response(req_id, sampled_ids)
 
@@ -148,6 +179,13 @@ class SuffixDecodingProposer:
             # we extract the pattern from the end of the input.
             start = max(0, num_tokens - self.max_tree_depth)
             pattern = input_batch.token_ids_cpu[i, start:num_tokens]
+  # ============ 添加：打印用于推测的上下文 ============
+            print(f"\n  [SPECULATION CONTEXT]")
+            print(f"    Pattern Token IDs: {pattern. tolist()}")
+            print(f"    Pattern length: {len(pattern)}")
+
+
+
             draft = self.suffix_cache.speculate(
                 req_id,
                 pattern,
@@ -157,6 +195,16 @@ class SuffixDecodingProposer:
                 max_spec_factor=self.max_spec_factor,
                 min_token_prob=self.min_token_prob,
             )
+
+ # ============ 关键打印：提议的 draft tokens ============
+            print(f"\n  [PROPOSED DRAFT]")
+            print(f"    Token IDs: {draft.token_ids}")
+            print(f"    Count: {len(draft. token_ids)}")
+            try:
+                draft_text = self.tokenizer.decode(draft. token_ids, skip_special_tokens=True)
+                print(f"    Text: '{draft_text}'")
+            except Exception as e:
+                print(f"    Text: [decode error: {e}]")
 
             draft_token_ids.append(draft.token_ids)
             # kyleryu
@@ -176,6 +224,22 @@ class SuffixDecodingProposer:
         print(f'kyleryulog_sampled_token_ids={sampled_token_ids}')
         # 打印草稿tokens
         print(f'kyleryulog_draft_token_ids={draft_token_ids}')
+
+        
+  # ============ 添加：打印本轮总结 ============
+        print(f"\n{'='*100}")
+        print(f"[STEP {self.step_count} SUMMARY]")
+        print(f"  Total requests processed: {len(draft_token_ids)}")
+        print(f"  Total accepted tokens: {sum(len(x) for x in sampled_token_ids)}")
+        print(f"  Total proposed draft tokens: {sum(len(x) for x in draft_token_ids)}")
+        
+        # 打印每个请求的详细统计
+        print(f"\n  Per-request breakdown:")
+        for idx, (sampled, draft) in enumerate(zip(sampled_token_ids, draft_token_ids)):
+            if sampled or draft:
+                print(f"    Req[{idx}]:  Accepted={len(sampled)}, Proposed={len(draft)}")
+        
+        print("="*100 + "\n")
 
         return draft_token_ids
 
