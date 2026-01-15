@@ -9,18 +9,15 @@ logger = init_logger(__name__)
 
 class SuffixDecodingProposer:
     """
-    Speculative decoding proposer for Suffix Decoding (https://arxiv.org/pdf/2411.04975).
-    This class imports and uses the official implementation from Arctic Inference
-    (https://github.com/snowflakedb/ArcticInference).
+    CTC-based speculative decoding proposer. 
+    Uses CTC recognition results as draft tokens for speculative decoding.
     """
 
     def __init__(self, vllm_config: VllmConfig):
         config = vllm_config.speculative_config
         self.num_speculative_tokens = config.num_speculative_tokens 
-        self.max_tree_depth = config.suffix_decoding_max_tree_depth
-        self.max_spec_factor = config.suffix_decoding_max_spec_factor
-        self.min_token_prob = config.suffix_decoding_min_token_prob
         self.max_model_len = vllm_config.model_config.max_model_len
+        
         # kyleryu - 获取tokenizer
         from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(
@@ -33,67 +30,146 @@ class SuffixDecodingProposer:
         self.ctc_start_ids = tokenizer.encode("<CTC>", add_special_tokens=False)
         self.ctc_end_ids = tokenizer.encode("</CTC>", add_special_tokens=False)
         
-        
-        # Lazy import to avoid error when Suffix Decoding is not used.
-        from arctic_inference.suffix_decoding import SuffixDecodingCache
-
-        # Initialize and empty cache. This object will take care of caching request
-        # outputs, evicting old requests, and manages the per-prompt suffix trees.
-        # kyleryu  
-        # 下面这部分不需要了
-        self.suffix_cache = SuffixDecodingCache(
-            max_tree_depth=config.suffix_decoding_max_tree_depth,
-            max_cached_requests=config.suffix_decoding_max_cached_requests,
-        )
         # kyleryu - 添加计数器
         self.step_count = 0
+        self.window = 8
 
-    # kyleryu
-    # 提取ctc文本
-    def _ectract_ctc_text(self, prompt_token_ids: list[int]):
-        prompt_list = prompt_token_ids.tolist()#转换成list
+    # kyleryu - 提取ctc文本
+    def _extract_ctc_text(self, prompt_token_ids):
+        """从 prompt 中提取 <CTC>... </CTC> 之间的 token IDs"""
+        prompt_list = prompt_token_ids.tolist()  # 转换成list
 
+        # 查找 <CTC> 标签
         start_index = None
-        for i in range(len(prompt_list)-len(self.ctc_start_ids) + 1):
+        for i in range(len(prompt_list) - len(self.ctc_start_ids) + 1):
             if prompt_list[i:i+len(self.ctc_start_ids)] == self.ctc_start_ids:
                 start_index = i + len(self.ctc_start_ids)
                 break
         if start_index is None:
             return None
         
+        # 查找 </CTC> 标签
         end_index = None
-        for i in range(start_index, len(prompt_list)-len(self.ctc_end_ids) + 1):
+        for i in range(start_index, len(prompt_list) - len(self.ctc_end_ids) + 1):
             if prompt_list[i:i+len(self.ctc_end_ids)] == self.ctc_end_ids:
                 end_index = i
                 break
         if end_index is None:
             return None
+        
         ctc_token_ids = prompt_list[start_index:end_index]
         return ctc_token_ids
+    def _update_ctc_pointer(self, req_id,last_draft,sampled_ids) -> None:
+        """根据已接受的 token 数量更新 CTC 指针
+        Args:
+            req_id (int): The request ID.
+            sampled_ids (list[int]): 本轮被验证通过的
+            last_draft (list[int]): 上一轮提议的draft tokens # 目前存疑❓️
+        """
+        if req_id not in self.ctc_cache or req_id not in self.ctc_pointer:
+            return
+        ctc_tokens = self.ctc_cache[req_id] # ctc的token列表
+        old_pointer = self.ctc_pointer[req_id] # 旧指针位置
+         # ============ 阶段 1: 计算匹配长度 ============
+        # sampled_ids 的结构: [draft_0, draft_1, ..., draft_k, correction]
+        # 我们需要找出有多少个 draft token 被验证通过
+        match_len = 0
+        if len(last_draft) > 0 and len(sampled_ids) > 0:
+            # 逐个对比 sampled_ids 和 last_draft    [draft_0, draft_1, ..., draft_k]   [draft_0, draft_1, ..., draft_k, draft_k+1]
+            # 注意： sampled_ids 的结构：[draft_0, draft_1, ..., draft_k, correction] 最后可能含有修正token
+            max_check = min(len(sampled_ids), len(last_draft))  # 
+            for i in range(max_check):
+                if sampled_ids[i] == last_draft[i]:
+                    match_len += 1
+                else:
+                    break # 遇到第一个不匹配就停止
+        print(f' [MATCH CHECK]')
+        print(f' Last draft:{last_draft[:10]}{"..." if len(last_draft)>10 else ""}')
+        print(f' Sampled IDs:{sampled_ids[:10]}{"..." if len(sampled_ids)>10 else ""}')
+        print(f' Match Length:{match_len}/{len(last_draft)}')
+
+        # 阶段1 ：基础指针前进
+        self.ctc_pointer[req_id] += match_len
+
+        print(f' [PHASE 1:MATCH UPDATE]')
+        print(f' Pointer moved: {old_pointer} -> {self.ctc_pointer[req_id]} (by match length+{match_len})')
+
+        # 阶段2 ：Resync 锚点搜索
+        # 获取修正token ，即最后一个sampled token
+        if len(sampled_ids) > match_len:
+            next_correct_token  = sampled_ids[match_len] # 修正token
+
+            print(f'[CORRECTION TOKEN]')
+            try:
+                correction_text = self.tokenizer.decode([next_correct_token])
+                print(f'  Tokrn ID: {next_correct_token}')
+                print(f'  Text: {correction_text}')
+            except:
+                print(f'  Tokrn ID: {next_correct_token}')
+            
+            # 在ctc后续部分搜索修正token 【滑窗搜索部分】
+
+            search_start = self.ctc_pointer[req_id]
+            found_offset = -1
+
+            if search_start < len(ctc_tokens):
+                search_end = min(search_start + self.window, len(ctc_tokens))
+                window_tokens = ctc_tokens[search_start:search_end]
+
+                print(f"  [RESYNC SEARCH]")
+                print(f"    Search window: CTC[{search_start}:{search_end}]")
+                print(f"    Window tokens: {window_tokens}")
+
+                # 搜索锚点
+                for k in range(len(window_tokens)):
+                    if window_tokens[k] == next_correct_token:
+                        found_offset = k
+                        break
+                if found_offset != -1 :
+                    # 找到锚点，更新指针
+                    skip_step = found_offset + 1
+                    old_ptr_phase2 = self.ctc_pointer[req_id]
+                    self.ctc_pointer[req_id] += skip_step
 
 
-    # kyleryu
-    # 逐请求生成draft tokens
-    # 输入参数:input_batch:这一批并发请求的状态，包含每个请求的 token 序列、prompt 长度、req_id 等状态
-    # sampled_token_ids:上一轮/本轮真实模型已经采样并提交的tokens，即已被确认的tokens
-    # 输出参数:draft_token_ids:对于batch里的请求，返回一个list[int]作为草稿
+                    print(f"    [ANCHOR FOUND]")
+                    print(f"      Offset: {found_offset}")
+                    print(f"      Skip tokens: {skip_step}")
+                    print(f"      Pointer moved: {old_ptr_phase2} -> {self.ctc_pointer[req_id]}")
+                else:
+                    # 未找到锚点: 保持指针不变 (CTC 可能有删除错误)
+                    print(f"    [ANCHOR NOT FOUND]")
+                    print(f"      Pointer unchanged: {self.ctc_pointer[req_id]}")
+                    print(f"      Reason: Possible deletion error in CTC")
+            else:
+                print(f"  [RESYNC SKIPPED]")
+                print(f"    Reason: CTC exhausted (pointer={search_start}, total={len(ctc_tokens)})")
+        
+        # ============ 最终状态 ============
+        total_move = self.ctc_pointer[req_id] - old_pointer
+        print(f"  [FINAL POINTER UPDATE]")
+        print(f"    Total movement: {old_pointer} -> {self.ctc_pointer[req_id]} (+{total_move})")
+        print(f"    Remaining CTC: {len(ctc_tokens) - self.ctc_pointer[req_id]}/{len(ctc_tokens)}")
+
+
+
     def propose(
         self,
         input_batch: InputBatch,
         sampled_token_ids: list[list[int]],
     ) -> list[list[int]]:
         """
-        Propose speculative tokens for each request in the input batch. Suffix Decoding
-        will speculate a dynamic number of tokens for each request every decoding step,
-        so each entry in the returned list may have different lengths.
+        Propose speculative tokens for each request using CTC. 
         """
-        draft_token_ids: list[list[int]] = []
-        # kyleryu
-        # 缓存ctc文本
-        if not hasattr(self,'ctc_cache'):
-            self.ctc_cache = {} # ctc文本  {req_id: ctc_token_ids} 字典
-            self.ctc_pointer = {}# ctc指针 {req_id: current_position}
-        # ============ 添加：打印本轮概览 ============
+        draft_token_ids:  list[list[int]] = []
+        
+        # kyleryu - 初始化缓存
+        if not hasattr(self, 'ctc_cache'):
+            self.ctc_cache = {}      # {req_id: ctc_token_ids}
+            self.ctc_pointer = {}    # {req_id: current_position}
+            self.last_draft_cache = {} # {req_id: last_draft_tokens}
+        
+        # ============ 打印本轮概览 ============
         self.step_count += 1
         print("\n" + "="*100)
         print(f"[STEP {self.step_count}] Batch Processing - {len(sampled_token_ids)} requests")
@@ -101,12 +177,11 @@ class SuffixDecodingProposer:
 
         for i, sampled_ids in enumerate(sampled_token_ids):
             if not sampled_ids:
-                # Skip speculative decoding for partial prefills.
+                # Skip speculative decoding for partial prefills. 
                 draft_token_ids.append([])
                 continue
 
-            # Skip requests that require sampling parameters that are not
-            # supported with speculative decoding. 跳过不支持的
+            # Skip unsupported requests
             req_id = input_batch.req_ids[i]
             if req_id in input_batch.spec_decode_unsupported_reqs:
                 draft_token_ids.append([])
@@ -114,52 +189,104 @@ class SuffixDecodingProposer:
 
             num_tokens = input_batch.num_tokens_no_spec[i]
             if num_tokens >= self.max_model_len:
-                # Skip requests that have already reached the max model length. 超长
+                # Skip requests that reached max length
                 draft_token_ids.append([])
                 continue
 
             index = input_batch.req_id_to_index[req_id]
-            # if req_id not in self.suffix_cache.active_requests:
-                # kyleryu- 删除suffix
-                # if req_id in self.suffix_cache.cached_requests:
-                #     # Reset the suffix cache for this request.
-                #     self.suffix_cache.evict_cached_response(req_id)
 
-            # ============ 添加：打印请求基本信息 ============
+            # ============ 打印请求基本信息 ============
             print(f"\n{'─'*100}")
             print(f"[Request {i}] ID: {req_id}")
             print(f"  Current length: {num_tokens} tokens")
 
-
-            if req_id not in self.ctc_cache: #首次处理该请求，提取ctc
+            # ============ 首次处理：提取 CTC ============
+            # 0115======== 添加验证首次生成token =========
+            if req_id not in self.ctc_cache:
                 num_prompt_tokens = input_batch.num_prompt_tokens[index]
-                prompt_token_ids = input_batch.token_ids_cpu[index, :num_prompt_tokens]
-                # kyleryu
-                print(f'num_prompt_tokens={num_prompt_tokens}')
-                print("==== DEBUG PROMPT TOKENS BEGIN ====")
-                print(prompt_token_ids)  
-                print("==== DEBUG PROMPT TOKENS END ====")
+                prompt_token_ids = input_batch.token_ids_cpu[index, : num_prompt_tokens]
+                
+                print(f"  [FIRST TIME] Extracting CTC from prompt ({num_prompt_tokens} tokens)")
 
-                ctc_token_ids = self._ectract_ctc_text(prompt_token_ids)
+                ctc_token_ids = self._extract_ctc_text(prompt_token_ids)
                 if ctc_token_ids is not None:
                     self.ctc_cache[req_id] = ctc_token_ids
-                    self.ctc_pointer[req_id] = 0 # 初始化指针
-                    ctc_text = self.tokenizer.decode(ctc_token_ids,skip_special_tokens=True)
-                    print(f"==== EXTRACTED CTC TEXT ====")
-                    print(f"CTC token IDs: {ctc_token_ids}")
-                    print(f"CTC text: {ctc_text}")
-                    print(f"============================")
-                   
+                    self.ctc_pointer[req_id] = 0
+                    self.last_draft_cache[req_id] = []
+                    ctc_text = self.tokenizer.decode(ctc_token_ids, skip_special_tokens=True)
+                    
+                    print(f"  [CTC] Extracted {len(ctc_token_ids)} tokens")
+                    print(f"  [CTC] Token IDs: {ctc_token_ids[: 20]}{'...' if len(ctc_token_ids) > 20 else ''}")
+                    print(f"  [CTC] Text: '{ctc_text}'")
+            # 0115============ 验证首token ============
+                if len(sampled_ids) > 0:
+                    print(f'\n  [VERIFY FIRST TOKEN]')
+                    print(f'  First sampled token ID: {sampled_ids}')
+
+                    # 检查已生成的token是否匹配CTC开头
+                    match_count = 0
+                    for j,token in enumerate(sampled_ids):
+                        if j < len(ctc_token_ids) and token == ctc_token_ids[j]:
+                            match_count += 1
+                        else:
+                            break
+                    if match_count > 0:
+                        self.ctc_pointer[req_id] = match_count
+                        print(f" ✓ Matched {match_count}/{len(sampled_ids)} tokens with CTC")
+                        print(f"    Pointer initialized to: {match_count}/{len(ctc_token_ids)}")
+                        
+                        try:
+                            matched_text = self.tokenizer.decode(ctc_token_ids[: match_count], skip_special_tokens=True)
+                            print(f"    Matched Text: '{matched_text}'")
+                        except Exception as e:
+                            pass
+                    else:
+                        print(f" ✗ No match found")
+                        print(f' Pointer unchanged: 0/0')
+                    
                 else:
-                    print('No CTC text found.')
+                    print(f"  [CTC] Not found in prompt")
                     self.ctc_cache[req_id] = []
                     self.ctc_pointer[req_id] = 0
+                    self.last_draft_cache[req_id] = []
 
-                # Start a new request, this will build the suffix tree for that prompt.
-                self.suffix_cache.start_request(req_id, prompt_token_ids)
+            # # 0115============ 非首次: 更新指针 (CPV 风格) ============
+            else:
+                if len(sampled_ids) > 0 and req_id in self.last_draft_cache:
+                    last_draft = self.last_draft_cache[req_id]
+                    
+                    print(f"\n  [POINTER UPDATE - CPV STYLE]")
+                    self._update_ctc_pointer(req_id, last_draft, sampled_ids)
+                else:
+                    print(f"\n  [NO POINTER UPDATE]")
+                    print(f"    Reason: No sampled tokens or no last draft")
 
 
-            # ============ 关键打印：本轮接受的 tokens ============
+
+
+            # # 0114============ 更新指针(根据上一轮接受的token数) ============
+            # else:
+            #     # sampled_ids 是上一轮被验证通过的tokenid
+            #     num_accepted = len(sampled_ids)
+            #     if num_accepted > 0 :
+            #         old_pointer = self.ctc_pointer[req_id]
+            #         self.ctc_pointer[req_id] += num_accepted # ❌️，这里不应该用这个
+
+            #         print(f'[UPDATED POINTER]')
+            #         print(f'  Accepted: {num_accepted}tokens from last step')
+            #         print(f'  Pointer moved : {old_pointer} -> {self.ctc_pointer[req_id]}')
+                
+            #         try:
+            #             accepted_text = self.tokenizer.decode(sampled_ids, skip_special_tokens=True)
+            #             print(f"    Text: '{accepted_text}'")
+            #         except Exception as e:
+            #             print(f"    Text: [decode error:  {e}]")
+            #     else:
+            #         print(f'[NO UPDATE]')
+            #         print(f'  No tokens accepted from last step; pointer remains at {self.ctc_pointer[req_id]}')
+
+
+            # ============ 打印本轮接受的 tokens ============
             print(f"\n  [ACCEPTED THIS STEP]")
             print(f"    Token IDs: {sampled_ids}")
             print(f"    Count: {len(sampled_ids)}")
@@ -169,74 +296,64 @@ class SuffixDecodingProposer:
             except Exception as e:
                 print(f"    Text: [decode error:  {e}]")
 
+            # ============ 从 CTC 中获取 draft tokens ============
+            if req_id in self.ctc_cache and len(self.ctc_cache[req_id]) > 0:
+                pointer = self.ctc_pointer[req_id]
+                ctc_tokens = self.ctc_cache[req_id]
 
+                # 计算可以提议的 draft 数量
+                remaining = len(ctc_tokens) - pointer
+                draft_count = min(
+                    self.num_speculative_tokens,
+                    remaining,
+                    self.max_model_len - num_tokens - 1
+                )
+                
+                if draft_count > 0:
+                    draft = ctc_tokens[pointer:pointer + draft_count]
+                    
+                    print(f"\n  [PROPOSED DRAFT]")
+                    print(f"    Token IDs: {draft}")
+                    print(f"    Count: {len(draft)}")
+                    print(f"    CTC pointer: {pointer}/{len(ctc_tokens)}")
+                    try:
+                        draft_text = self.tokenizer.decode(draft, skip_special_tokens=True)
+                        print(f"    Text: '{draft_text}'")
+                    except Exception as e:
+                        print(f"    Text: [decode error: {e}]")
+                    
+                    draft_token_ids.append(draft)
+                    self.last_draft_cache[req_id] = draft # 保存本轮draft
+                    
+                    # TODO: 指针更新应该在验证后进行
+                    # self.ctc_pointer[req_id] += accepted_count
+                else:
+                    print(f"\n  [PROPOSED DRAFT]")
+                    print(f"    Token IDs:  []")
+                    print(f"    Count: 0")
+                    print(f"    Reason: No remaining CTC tokens")
+                    draft_token_ids.append([])
+                    self.last_draft_cache[req_id] = []
+            else:
+                print(f"\n  [PROPOSED DRAFT]")
+                print(f"    Token IDs:  []")
+                print(f"    Count: 0")
+                print(f"    Reason:  No CTC cache available")
+                draft_token_ids.append([])
+                if req_id in self.last_draft_cache:
+                    self.last_draft_cache[req_id] = []
 
-
-            # Append the newly sampled ids to the suffix cache for this request.
-            self.suffix_cache.add_active_response(req_id, sampled_ids)
-
-            # Suffix decoding only uses the most recent tokens up to max_tree_depth, so
-            # we extract the pattern from the end of the input.
-            start = max(0, num_tokens - self.max_tree_depth)
-            pattern = input_batch.token_ids_cpu[i, start:num_tokens]
-  # ============ 添加：打印用于推测的上下文 ============
-            print(f"\n  [SPECULATION CONTEXT]")
-            print(f"    Pattern Token IDs: {pattern. tolist()}")
-            print(f"    Pattern length: {len(pattern)}")
-
-
-
-            draft = self.suffix_cache.speculate(
-                req_id,
-                pattern,
-                max_spec_tokens=min(
-                    self.num_speculative_tokens, self.max_model_len - num_tokens - 1
-                ),
-                max_spec_factor=self.max_spec_factor,
-                min_token_prob=self.min_token_prob,
-            )
-
- # ============ 关键打印：提议的 draft tokens ============
-            print(f"\n  [PROPOSED DRAFT]")
-            print(f"    Token IDs: {draft.token_ids}")
-            print(f"    Count: {len(draft. token_ids)}")
-            try:
-                draft_text = self.tokenizer.decode(draft. token_ids, skip_special_tokens=True)
-                print(f"    Text: '{draft_text}'")
-            except Exception as e:
-                print(f"    Text: [decode error: {e}]")
-
-            draft_token_ids.append(draft.token_ids)
-            # kyleryu
-            logger.info("logkyleryu_n_reqs=%d lens=%s", len(sampled_token_ids),
-                        [len(x) for x in sampled_token_ids][:8])
-            logger.info("logkyleryu_draft_lens=%s", [len(x) for x in draft_token_ids][:8])
-
-
-
-        # Stop requests that were not seen in the input batch.
-        for req_id in (
-            self.suffix_cache.active_requests - input_batch.req_id_to_index.keys()
-        ):
-            self.suffix_cache.stop_request(req_id)
-        print(f'kyleryulog_SuffixDecoding proposer drafted tokens for {len(draft_token_ids)} requests.')
-        # 打印sampled tokens
-        print(f'kyleryulog_sampled_token_ids={sampled_token_ids}')
-        # 打印草稿tokens
-        print(f'kyleryulog_draft_token_ids={draft_token_ids}')
-
-        
-  # ============ 添加：打印本轮总结 ============
+        # ============ 打印本轮总结 ============
         print(f"\n{'='*100}")
         print(f"[STEP {self.step_count} SUMMARY]")
-        print(f"  Total requests processed: {len(draft_token_ids)}")
+        print(f"  Total requests processed:  {len(draft_token_ids)}")
         print(f"  Total accepted tokens: {sum(len(x) for x in sampled_token_ids)}")
         print(f"  Total proposed draft tokens: {sum(len(x) for x in draft_token_ids)}")
         
         # 打印每个请求的详细统计
         print(f"\n  Per-request breakdown:")
         for idx, (sampled, draft) in enumerate(zip(sampled_token_ids, draft_token_ids)):
-            if sampled or draft:
+            if sampled or draft: 
                 print(f"    Req[{idx}]:  Accepted={len(sampled)}, Proposed={len(draft)}")
         
         print("="*100 + "\n")
@@ -244,5 +361,5 @@ class SuffixDecodingProposer:
         return draft_token_ids
 
     def load_model(self, *args, **kwargs):
-        # No model to load.
+        # No model to load for CTC-based proposer
         pass
